@@ -20,6 +20,8 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://app:app@db:5432/seals
+      # 预演状态令牌签名密钥；生产部署务必通过同名环境变量覆盖（默认值仅供本地演示）
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-insecure-rehearsal-secret-change-me}
     depends_on:
       db:
         condition: service_healthy

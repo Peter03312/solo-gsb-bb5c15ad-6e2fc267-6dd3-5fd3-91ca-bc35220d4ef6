@@ -29,9 +29,16 @@ def norm_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def request_hash(exhibit_id: str, records: list[dict]) -> str:
-    """请求体指纹：用于幂等键下检测「同键不同载荷」。"""
-    return sha256_hex(canonical_json({"exhibit_id": exhibit_id, "records": records}))
+def request_hash(exhibit_id: str, records: list[dict], handover_token: str | None = None) -> str:
+    """请求体指纹：用于幂等键下检测「同键不同载荷」。
+
+    携带 Handover-Token 的提交，令牌计入载荷身份：
+    同键但有/无令牌、或令牌不同，均视为不同载荷（409）。
+    """
+    payload: dict = {"exhibit_id": exhibit_id, "records": records}
+    if handover_token:
+        payload["handover_token"] = handover_token
+    return sha256_hex(canonical_json(payload))
 
 
 def record_hash(

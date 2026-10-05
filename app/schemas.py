@@ -122,3 +122,25 @@ class BatchSummary(BaseModel):
     record_count: int
     first_break: Optional[FirstBreakOut]
     created_at: datetime
+
+
+class HandoverTokenOut(BaseModel):
+    """预演签发的展品状态令牌（正式提交可通过 Handover-Token 头携带）。"""
+
+    token: str = Field(description="自包含 HMAC 令牌，绑定展品与签发时的哈希链状态")
+    exhibit_id: str
+    chain_length: int
+    chain_head_hash: str
+    issued_at: datetime
+
+
+class RehearsalOut(BaseModel):
+    """预演核验结果：只读，不写批次报告/交接记录/展品状态。"""
+
+    exhibit_id: str
+    status: Literal["ACCEPTED", "REJECTED"]
+    record_count: int
+    first_break: Optional[FirstBreakOut]
+    items: list[ItemOut]
+    rehearsed_at: datetime
+    state_token: HandoverTokenOut

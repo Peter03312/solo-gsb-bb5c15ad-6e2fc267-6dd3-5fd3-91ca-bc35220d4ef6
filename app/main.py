@@ -20,6 +20,14 @@ from .schemas import (
     ChainOut,
     ExhibitCreate,
     ExhibitOut,
+    RehearsalOut,
+)
+from .tokens import (
+    InvalidTokenError,
+    TOKEN_SECRET,
+    issue_token,
+    parse_token,
+    state_matches,
 )
 from .validation import ExhibitState, validate_batch
 
@@ -52,8 +60,8 @@ def _exhibit_state(row: dict) -> ExhibitState:
     )
 
 
-def _build_report(batch_id: uuid.UUID, exhibit_id: str, result, record_count: int, now: datetime) -> dict:
-    items = [
+def _serialize_items(result) -> list[dict]:
+    return [
         {
             "seq": item.seq,
             "ok": item.ok,
@@ -61,18 +69,24 @@ def _build_report(batch_id: uuid.UUID, exhibit_id: str, result, record_count: in
         }
         for item in result.items
     ]
-    first_break = None
+
+
+def _serialize_first_break(result) -> dict | None:
     fb = result.first_break
-    if fb is not None:
-        seq, reason = fb
-        first_break = {"seq": seq, "rule": reason.rule, "message": reason.message}
+    if fb is None:
+        return None
+    seq, reason = fb
+    return {"seq": seq, "rule": reason.rule, "message": reason.message}
+
+
+def _build_report(batch_id: uuid.UUID, exhibit_id: str, result, record_count: int, now: datetime) -> dict:
     return {
         "batch_id": str(batch_id),
         "exhibit_id": exhibit_id,
         "status": "ACCEPTED" if result.accepted else "REJECTED",
         "record_count": record_count,
-        "first_break": first_break,
-        "items": items,
+        "first_break": _serialize_first_break(result),
+        "items": _serialize_items(result),
         "idempotent_replay": False,
         "created_at": now.isoformat(),
     }
@@ -127,24 +141,86 @@ def get_exhibit(exhibit_id: str):
 # ---------------------------------------------------------------- 交接批次（核心）
 
 
+@app.post("/api/v1/handover-batches/rehearse", response_model=RehearsalOut, tags=["handovers"])
+def rehearse_handover_batch(payload: BatchRequest):
+    """预演一批交接：只读核验，不写入批次报告、交接记录，也不推进展品状态。
+
+    - 接受与正式提交完全相同的展品编号与按序记录，记录格式仍按现有规则校验
+      （载荷格式非法时返回 422）。
+    - 返回逐条核验结果、首个断点，以及绑定展品当前链状态的 `state_token`。
+    - 未知展品返回 404。
+    - 正式提交时可在 `Handover-Token` 头携带令牌；链状态未变化才被受理。
+    """
+    with get_conn() as conn:
+        exhibit = conn.execute(
+            "SELECT * FROM exhibits WHERE exhibit_id = %s",
+            (payload.exhibit_id,),
+        ).fetchone()
+    if not exhibit:
+        raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
+
+    result = validate_batch(_exhibit_state(exhibit), payload.records)
+    now = datetime.now(timezone.utc)
+    token = issue_token(
+        TOKEN_SECRET,
+        payload.exhibit_id,
+        exhibit["chain_length"],
+        exhibit["chain_head_hash"],
+        issued_at=int(now.timestamp()),
+    )
+    return {
+        "exhibit_id": payload.exhibit_id,
+        "status": "ACCEPTED" if result.accepted else "REJECTED",
+        "record_count": len(payload.records),
+        "first_break": _serialize_first_break(result),
+        "items": _serialize_items(result),
+        "rehearsed_at": now.isoformat(),
+        "state_token": {
+            "token": token,
+            "exhibit_id": payload.exhibit_id,
+            "chain_length": exhibit["chain_length"],
+            "chain_head_hash": exhibit["chain_head_hash"],
+            "issued_at": now.isoformat(),
+        },
+    }
+
+
 @app.post("/api/v1/handover-batches", response_model=BatchReport, tags=["handovers"])
 def submit_handover_batch(
     payload: BatchRequest,
     idempotency_key: str = Header(min_length=1, max_length=128),
+    handover_token: str | None = Header(
+        default=None,
+        alias="Handover-Token",
+        max_length=2048,
+        description="可选：预演（/rehearse）签发的展品状态令牌",
+    ),
 ):
     """提交一批交接记录并核验。
 
     - 幂等：携带 `Idempotency-Key` 请求头；同键同载荷重试返回同一报告
       （`idempotent_replay=true`），同键不同载荷返回 409。
+      携带 `Handover-Token` 时令牌计入载荷身份；同键成功重试即使链已推进，
+      也直接返回原报告。
+    - 预演令牌（可选）：令牌格式无效 -> 400；跨展品或链状态已变化 -> 409，
+      冲突时不生成批次报告，调用方须重新预演。不带令牌的提交行为不变。
     - 事务：核验通过则批次报告与全部交接记录一并写入并推进链上状态；
       核验失败仅落核验报告（供幂等重试与审计），不写入任何交接记录。
     """
+    # 1) 令牌先验格式/签名（纯本地校验，400 参数错误），再在展品行锁上比对状态
+    parsed_token = None
+    if handover_token and handover_token.strip():
+        try:
+            parsed_token = parse_token(TOKEN_SECRET, handover_token)
+        except InvalidTokenError as exc:
+            raise HTTPException(status_code=400, detail=f"Handover-Token 无效：{exc}")
+
     records_for_hash = [r.model_dump(mode="json") for r in payload.records]
-    req_hash = request_hash(payload.exhibit_id, records_for_hash)
+    req_hash = request_hash(payload.exhibit_id, records_for_hash, handover_token)
 
     try:
         with get_conn() as conn:
-            # 1) 幂等预检
+            # 2) 幂等预检（同键成功重试即使链已推进/令牌已过期，也返回原报告）
             existing = conn.execute(
                 "SELECT * FROM batches WHERE idempotency_key = %s", (idempotency_key,)
             ).fetchone()
@@ -156,15 +232,39 @@ def submit_handover_batch(
                     )
                 return _replay_report(existing)
 
-            # 2) 锁定展品行，串行化同一展品的批次，保证链式状态一致
+            # 3) 锁定展品行，串行化同一展品的批次，保证链式状态一致
             exhibit = conn.execute(
                 "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
                 (payload.exhibit_id,),
             ).fetchone()
             if not exhibit:
+                if parsed_token is not None:
+                    # 令牌签名有效但展品对不上：按跨展品状态冲突处理
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"令牌属于展品「{parsed_token.exhibit_id}」，"
+                               f"不能用于展品「{payload.exhibit_id}」，请重新预演",
+                    )
                 raise HTTPException(status_code=404, detail=f"展品「{payload.exhibit_id}」不存在")
 
-            # 3) 核验
+            # 4) 令牌归属与链状态比对（行锁内完成，与链推进互斥）
+            if parsed_token is not None:
+                if parsed_token.exhibit_id != payload.exhibit_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"令牌属于展品「{parsed_token.exhibit_id}」，"
+                               f"不能用于展品「{payload.exhibit_id}」，请重新预演",
+                    )
+                if not state_matches(
+                    parsed_token, exhibit["chain_length"], exhibit["chain_head_hash"]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="展品链状态自预演后已变化（哈希链已推进），"
+                               "令牌失效，请重新预演后再提交",
+                    )
+
+            # 5) 核验
             result = validate_batch(_exhibit_state(exhibit), payload.records)
             batch_id = uuid.uuid4()
             now = datetime.now(timezone.utc)
@@ -179,7 +279,7 @@ def submit_handover_batch(
                  report["status"], Jsonb(report), now),
             )
 
-            # 4) 通过才写交接记录并推进链上状态；失败则只有批次报告落库
+            # 6) 通过才写交接记录并推进链上状态；失败则只有批次报告落库
             if result.accepted:
                 prev_hash = exhibit["chain_head_hash"]
                 prev_seal = exhibit["current_seal"]
