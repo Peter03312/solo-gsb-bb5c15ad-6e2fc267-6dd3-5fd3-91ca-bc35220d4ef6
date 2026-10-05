@@ -31,6 +31,10 @@ class HandoverIn(BaseModel):
 class BatchRequest(BaseModel):
     exhibit_id: str = Field(min_length=1, max_length=64, description="展品编号")
     records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="按时间排列的交接记录")
+    state_token: Optional[str] = Field(
+        default=None, max_length=1024,
+        description="预演签发的链状态令牌（可选）；携带时须属于本展品且链状态未变化",
+    )
 
 
 class ReasonOut(BaseModel):
@@ -60,6 +64,18 @@ class BatchReport(BaseModel):
     first_break: Optional[FirstBreakOut]
     items: list[ItemOut]
     idempotent_replay: bool
+    created_at: datetime
+
+
+class PreviewReport(BaseModel):
+    """预演核验结果（不落库，无批次号；附链状态令牌供正式提交携带）。"""
+
+    exhibit_id: str
+    status: Literal["ACCEPTED", "REJECTED"]
+    record_count: int
+    first_break: Optional[FirstBreakOut]
+    items: list[ItemOut]
+    state_token: str
     created_at: datetime
 
 
